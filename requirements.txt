@@ -8,3 +8,4 @@ azure-identity
 python-dotenv 
 asyncio 
 tqdm 
+langchain_mcp_adapters
