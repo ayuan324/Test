@@ -296,28 +296,47 @@ async def cell(model, query, ui_callback=None):
 
 # 仅在直接运行此脚本时执行
 if __name__ == "__main__":
-    # ... (print_callback remains the same) ...
+    # 定义一个简单的打印回调
+    def print_callback(step_name, content, token_used=0, time_taken=0):
+        print("="*50)
+        print(f"状态: {step_name} (耗时: {time_taken:.2f}s | Tokens: {token_used})")
+        if isinstance(content, (dict, list)):
+            print(f"内容: \n{json.dumps(content, ensure_ascii=False, indent=2)}")
+        else:
+            print(f"内容: {content}")
+        print("="*50)
 
-    if not tavily_api_key:
-        # 如果 Tavily client 是 None，这里直接退出或给出错误
+    print("--- deep_research.py 作为主脚本运行 (仅用于本地测试) ---")
+
+    if not tavily_client:
         print("错误：Tavily 客户端未初始化，请确保 TAVILY_API_KEY 已设置。")
     else:
         # --- 为命令行测试创建模型 ---
         try:
-            test_model_name = "qwen-max" # 或者从命令行参数获取
+            test_model_name = "qwen-max" # 或从环境变量/参数获取
             test_temperature = 0.7
-            print(f"命令行测试，使用模型: {test_model_name}, 温度: {test_temperature}")
-            # create_llm 会检查所需的环境变量
+            print(f"命令行测试，尝试创建模型: {test_model_name}, 温度: {test_temperature}")
             cli_model = create_llm(model_name=test_model_name, temperature=test_temperature)
+            print(f"模型 {test_model_name} 创建成功。")
         except ValueError as e:
-            print(f"创建模型时出错: {e}")
+            print(f"创建测试模型时出错: {e}")
             cli_model = None
         except Exception as e:
-            print(f"创建模型时发生未知错误: {e}")
+            print(f"创建测试模型时发生未知错误: {e}")
             cli_model = None
 
         if cli_model:
-            test_query = input("请输入测试查询：\n")
-            asyncio.run(cell(cli_model, test_query, ui_callback=print_callback))
+            # 移除 input()，改为使用一个固定的测试查询
+            # test_query = input("请输入测试查询：\n")
+            test_query = "分析一下最近关于人工智能的重大新闻"
+            print(f"使用固定测试查询: '{test_query}'")
+            print("开始执行 cell 函数...")
+            try:
+                 asyncio.run(cell(cli_model, test_query, ui_callback=print_callback))
+                 print("cell 函数执行完毕。")
+            except Exception as cell_exec_error:
+                 print(f"执行 cell 函数时出错: {cell_exec_error}")
         else:
-            print("无法创建测试模型，退出。")
+            print("无法创建测试模型，无法执行 cell 函数。")
+
+    print("--- deep_research.py 主脚本测试结束 ---")
