@@ -1,4 +1,8 @@
 import streamlit as st
+from dotenv import load_dotenv # 导入
+
+load_dotenv() # 在所有其他导入之前加载 .env 文件中的环境变量
+
 import time
 import asyncio
 from deep_research import cell, create_llm # 导入 cell 和新的 create_llm
@@ -45,10 +49,73 @@ with col1:
     # 过程展示区 (使用 placeholder)
     steps_placeholder = st.empty() # 创建一个空占位符
 
+    # --- Helper to get emoji based on step name (Moved to be accessible more globally if needed, or keep inside update_ui_display) ---
+    def get_step_emoji(step_name):
+        name_lower = step_name.lower()
+        if "失败" in name_lower or "错误" in name_lower:
+            return "⚠️"
+        elif "细化任务中" in name_lower:
+            return "🧠"
+        elif "任务细化完成" in name_lower:
+            return "🧩"
+        elif "处理子任务" in name_lower:
+            return "⚙️"
+        elif "关键词" in name_lower:
+            return "🔑"
+        elif "查找信息 (tavily)" in name_lower: # Corrected from (tavily) if it was a typo
+            return "🔍"
+        elif "查找信息完成" in name_lower:
+            return "📄"
+        elif "总结所有信息" in name_lower:
+            return "✍️"
+        elif "生成最终报告" in name_lower: # This step usually means report is ready
+            return "📝" # Changed from ✅ to avoid confusion with final report header
+        elif "评估搜索质量中" in name_lower:
+            return "🧐"
+        elif "搜索质量评估完成" in name_lower:
+            return "👍"
+        elif "搜索结果接受" in name_lower:
+            return "👌"
+        elif "搜索重试达到上限" in name_lower or "搜索质量评估跳过" in name_lower :
+            return "🤔"
+        else:
+            return "➡️" # Default
+
+    # --- Logic to display steps (Moved out to be called explicitly after rerun if needed) ---
+    def display_steps_from_session_state(placeholder_container):
+        with placeholder_container.container():
+            if st.session_state['steps']:
+                st.subheader("🤔 思考过程链") # Unified title
+                num_steps = len(st.session_state['steps'])
+                # 反向遍历步骤列表
+                for i in range(num_steps - 1, -1, -1):
+                    s_name, s_content, s_tokens, s_time = st.session_state['steps'][i]
+                    is_newest_step = (i == num_steps - 1)
+                    emoji = get_step_emoji(s_name)
+                    expander_label = f"{emoji} {i + 1}. {s_name}"
+                    # When a final report is present, default to collapsed, otherwise newest is expanded
+                    expanded_default = is_newest_step if not st.session_state['final_report'] else False
+
+                    with st.expander(expander_label, expanded=expanded_default):
+                        st.markdown(f"_耗时: {s_time:.2f}s | Tokens: {s_tokens}_ ")
+                        st.markdown("---") # 分隔符
+                        if isinstance(s_content, (dict, list)):
+                            try:
+                                st.code(json.dumps(s_content, ensure_ascii=False, indent=2), language='json')
+                            except TypeError: # Handle potential non-serializable content if any
+                                st.write(s_content)
+                        else:
+                            st.markdown(s_content)
+            elif st.session_state['running']: # If running but no steps yet
+                 st.write("⏳ Agent 正在初始化，请稍候...")
+
     # 最终报告区
     if st.session_state['final_report']:
         st.header("✅ 最终报告")
         st.markdown(st.session_state['final_report'])
+        # If final report is shown, and steps exist, ensure they are displayed
+        if st.session_state['steps']:
+            display_steps_from_session_state(steps_placeholder)
 
 with col2:
     st.header("配置")
@@ -124,57 +191,7 @@ elif st.session_state['running'] and not st.session_state['final_report']:
             # 定义一个包装回调，用于更新 placeholder (修改内部逻辑)
             def update_ui_display(*args):
                 ui_callback(*args) # 先用旧回调更新 state
-
-                # -- Helper to get emoji based on step name --
-                def get_step_emoji(step_name):
-                    name_lower = step_name.lower()
-                    if "失败" in name_lower or "错误" in name_lower:
-                        return "⚠️"
-                    elif "细化任务中" in name_lower:
-                        return "🧠"
-                    elif "任务细化完成" in name_lower:
-                        return "🧩"
-                    elif "处理子任务" in name_lower:
-                        return "⚙️"
-                    elif "关键词" in name_lower:
-                        return "🔑"
-                    elif "查找信息 (tavily)" in name_lower:
-                        return "🔍"
-                    elif "查找信息完成" in name_lower:
-                        return "📄"
-                    elif "总结所有信息" in name_lower:
-                        return "✍️"
-                    elif "生成最终报告" in name_lower:
-                        return "✅"
-                    else:
-                        return "➡️" # Default
-
-                # 更新步骤显示区域 (使用 expander)
-                with steps_placeholder.container():
-                    st.subheader("思考过程链") # 可以加个标题
-                    if not st.session_state['steps']:
-                        st.write("等待 Agent 开始...")
-                    else:
-                        num_steps = len(st.session_state['steps'])
-                        # 反向遍历步骤列表
-                        for i in range(num_steps - 1, -1, -1):
-                            s_name, s_content, s_tokens, s_time = st.session_state['steps'][i]
-                            # is_last_step 在反向遍历中变为 is_first_displayed_step
-                            is_newest_step = (i == num_steps - 1)
-                            emoji = get_step_emoji(s_name)
-                            # 标签现在使用反向计数或保持正向计数？保持正向易于理解
-                            expander_label = f"{emoji} {i + 1}. {s_name}" # 保持原有编号
-                            with st.expander(expander_label, expanded=is_newest_step):
-                                # 在展开内容中显示详细信息和耗时/token
-                                st.markdown(f"_耗时: {s_time:.2f}s | Tokens: {s_tokens}_ ")
-                                st.markdown("---") # 分隔符
-                                if isinstance(s_content, (dict, list)):
-                                    try:
-                                        st.code(json.dumps(s_content, ensure_ascii=False, indent=2), language='json')
-                                    except TypeError:
-                                        st.write(s_content) # 回退显示原始格式
-                                else:
-                                    st.markdown(s_content)
+                display_steps_from_session_state(steps_placeholder) # Call the unified display function
 
                 # 更新统计信息区域
                 with stats_placeholder.container():
@@ -197,6 +214,9 @@ else:
          total_time = time.time() - st.session_state.get('start_time', 0)
          st.metric("总耗时", f"{total_time:.2f} 秒" if st.session_state.get('start_time', 0) > 0 else "N/A")
          st.metric("总Token消耗", f"{st.session_state.get('token_total', 0)}")
-     # 清空步骤区域如果不在运行中且没有最终报告
-     if not st.session_state['running'] and not st.session_state['final_report']:
-         steps_placeholder.empty() 
+     # After all logic, explicitly display steps if they exist and we are not actively running a new query
+     # This covers the case after st.rerun() when final_report is set.
+     if not st.session_state['running'] and st.session_state['steps']:
+         display_steps_from_session_state(steps_placeholder)
+     elif not st.session_state['running'] and not st.session_state['steps']: # Not running and no steps
+         steps_placeholder.empty() # Clear if not running and no history 
