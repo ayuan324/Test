@@ -136,163 +136,224 @@ def _get_token_usage(response):
     print("[Warning] 无法获取 token 使用量信息")
     return 0
 
+async def assess_search_quality(model, original_query: str, subtask: str, keywords: list, tavily_response: dict, ui_callback=None) -> str:
+    """评估Tavily搜索结果的质量。"""
+    t0 = time.time()
+    if ui_callback:
+        ui_callback("评估搜索质量中...", f"正在评估针对子任务 '{str(subtask)[:30]}...' 的搜索结果", 0, 0)
+
+    # 构建评估prompt
+    prompt_messages = [
+        SystemMessage(
+            """你是一个专业的搜索结果质量评估员。你需要根据原始用户查询、当前子任务、使用的搜索关键词以及Tavily返回的搜索结果，来评估搜索结果的质量。\n"
+            "Tavily的响应包含 `answer` (一个直接的综合答案) 和 `results` (一个包含多个网页摘要的列表)。\n"
+            "请评估这些结果是否与子任务高度相关、信息是否丰富、是否能为回答子任务提供足够的材料。\n"
+            "你的评估等级只能是以下四种之一：excellent, good, poor, failed.\n"
+            "- excellent: 结果高度相关，信息丰富，看起来可以直接用于回答子任务。Tavily的 `answer` 字段质量很高。\n"
+            "- good: 结果相关，包含有用的信息，但可能需要进一步筛选或补充。Tavily的 `answer` 字段有用但可能不完整。\n"
+            "- poor: 结果相关性较低，信息量不足，或者Tavily的 `answer` 字段质量差或不相关。可能需要用不同的关键词重试。\n"
+            "- failed: 结果完全不相关，或者搜索API返回错误/无结果。必须重试。\n"
+            "请只返回评估等级的单词，例如：good"""
+        ),
+        HumanMessage(
+            f"""原始用户查询: {original_query}\n"
+            f"当前子任务/方面: {subtask}\n"
+            f"使用的搜索关键词: {keywords}\n"
+            f"Tavily搜索结果 (JSON):\n{json.dumps(tavily_response, ensure_ascii=False, indent=2)}\n\n"
+            f"请评估以上搜索结果的质量 (excellent, good, poor, failed):"""
+        )
+    ]
+
+    response = await model.ainvoke(prompt_messages)
+    quality_grade = response.content.strip().lower()
+    t1 = time.time()
+    tokens_used = _get_token_usage(response)
+
+    valid_grades = ["excellent", "good", "poor", "failed"]
+    if quality_grade not in valid_grades:
+        # 如果返回的不是标准答案，默认给 poor，并记录原始回答
+        if ui_callback:
+            ui_callback("搜索质量评估格式错误", f"LLM返回非标准评估: '{quality_grade}'. 默认为 poor.", tokens_used, t1-t0)
+        quality_grade = "poor"
+    elif ui_callback:
+        ui_callback("搜索质量评估完成", f"子任务 '{str(subtask)[:30]}...' 的搜索结果质量: {quality_grade.upper()}", tokens_used, t1-t0)
+    
+    return quality_grade
 
 async def cell(model, query, ui_callback=None):
-    """
-    修改后的思考单元：
-    1. 对用户 query 进行一次性细化，分解为子任务列表。
-    2. 顺序对每个子任务：生成关键词 -> Tavily 搜索。
-    3. 收集所有子任务的搜索结果。
-    4. 基于所有结果生成最终报告。
-    """
-    aggregated_results = [] # 存储所有子任务的搜索结果
+    """修改后的思考单元，包含搜索结果质量评估和重试机制。"""
+    aggregated_results = []
+    max_search_retries = 3 # 每个子任务最多重试3次搜索
 
-    # --- 1. 一次性任务细化 --- (不再递归)
-    t0 = time.time()
+    # --- 1. 一次性任务细化 ---
+    t0_refine = time.time()
     refine_message = [
-        SystemMessage("""
-                    你是一个经验丰富的项目经理。你需要根据用户提出的研究任务，将其分解为一系列具体、可执行的子任务或需要研究的关键方面。
-                    分解的粒度应该适中，能够覆盖用户需求的核心，避免过于琐碎或过于宏大。
-                    请根据任务的复杂性决定分解出的子任务数量。
-                    输出的内容必须是一个 Python 列表，例如：["子任务1", "方面2", "需要调研的点3", ...]
-                    """),
+        SystemMessage("""你是一个经验丰富的项目经理。你需要根据用户提出的研究任务，将其分解为一系列具体、可执行的子任务或需要研究的关键方面。分解的粒度应该适中，能够覆盖用户需求的核心，避免过于琐碎或过于宏大。请根据任务的复杂性决定分解出的子任务数量。输出的内容必须是一个 Python 列表，例如：["子任务1", "方面2", "需要调研的点3", ...]"""),
         HumanMessage(f"请将以下用户研究任务进行分解：\n\n{query}")
     ]
-    if ui_callback:
-        ui_callback("细化任务中...", f"正在为 '{query[:50]}...' 分解子任务", 0, 0)
+    if ui_callback: ui_callback("细化任务中...", f"正在为 '{query[:50]}...' 分解子任务", 0, 0)
     response_refine = await model.ainvoke(refine_message)
-    t1 = time.time()
+    t1_refine = time.time()
     tokens_refine = _get_token_usage(response_refine)
     refined_subtasks_str = response_refine.content
     try:
         refined_subtasks = ast.literal_eval(refined_subtasks_str)
-        if not isinstance(refined_subtasks, list):
-            refined_subtasks = [refined_subtasks_str] # 如果解析出来不是列表，则整个作为一项
+        if not isinstance(refined_subtasks, list): refined_subtasks = [refined_subtasks_str]
     except (ValueError, SyntaxError):
-        refined_subtasks = [refined_subtasks_str] # 解析失败，整个字符串作为一个子任务
-        if ui_callback:
-             ui_callback("解析细化列表失败", f"无法解析LLM返回的列表: {refined_subtasks_str}", tokens_refine, t1 - t0)
+        refined_subtasks = [refined_subtasks_str]
+        if ui_callback: ui_callback("解析细化列表失败", f"无法解析LLM返回的列表: {refined_subtasks_str}", tokens_refine, t1_refine - t0_refine)
+    if ui_callback: ui_callback("任务细化完成", {"原始任务": query, "分解出的子任务/方面": refined_subtasks}, tokens_refine, t1_refine - t0_refine)
 
-    if ui_callback:
-        ui_callback("任务细化完成", {"原始任务": query, "分解出的子任务/方面": refined_subtasks}, tokens_refine, t1 - t0)
-
-    # --- 2. 顺序执行子任务搜索 --- (不再有评估和递归)
+    # --- 2. 顺序执行子任务搜索 ---
     for i, subtask in enumerate(refined_subtasks):
         current_task_label = f"子任务 {i+1}/{len(refined_subtasks)}: {str(subtask)[:30]}..."
-        if ui_callback:
-             ui_callback("处理子任务", f"开始处理: {current_task_label}", 0, 0)
-
-        # --- 2a. 生成搜索关键词 ---
-        t0_key = time.time()
-        message_key = [
-            SystemMessage("""
-                        你是一名熟练的搜索引擎使用者。请根据用户的总体研究任务和当前正在处理的具体子任务/方面，生成3个最相关的搜索关键词。
-                        输出格式必须是 Python 列表，例如：["关键词1", "关键词2", "关键词3"]
-                        """),
-            HumanMessage(f"总体研究任务：{query}\n当前子任务/方面：{subtask}\n请生成搜索关键词。")
-        ]
-        if ui_callback:
-             ui_callback(f"为子任务生成关键词... ({current_task_label})", f"正在为 '{str(subtask)[:30]}...' 生成关键词", 0, 0)
-        response_key = await model.ainvoke(message_key)
-        t1_key = time.time()
-        tokens_key = _get_token_usage(response_key)
-        content_key = response_key.content
-        try:
-            keywords_list = ast.literal_eval(content_key)
-            if not isinstance(keywords_list, list):
-                keywords_list = [content_key]
-        except (ValueError, SyntaxError):
-            keywords_list = [content_key]
-            if ui_callback:
-                ui_callback("解析关键词列表失败", {"子任务": subtask, "原始输出": content_key}, tokens_key, t1_key - t0_key)
-
-        if ui_callback:
-            ui_callback(f"关键词生成完成 ({current_task_label})", {"子任务": subtask, "关键词": keywords_list}, tokens_key, t1_key - t0_key)
-
-        # --- 2b. Tavily 搜索 ---
-        t0_search = time.time()
-        search_info_for_subtask = []
-        search_summary_ui = ""
-
-        if not tavily_client:
-            error_msg = "Tavily Client 未初始化 (缺少 API 密钥)"
-            if ui_callback:
-                ui_callback("搜索错误", error_msg, 0, 0)
-            search_info_for_subtask.append({"keyword": "N/A", "info": error_msg})
-            search_summary_ui += error_msg + "\n"
-        else:
-            combined_keywords = " ".join(keywords_list)
-            if ui_callback:
-                 ui_callback(f"查找信息 (Tavily)... ({current_task_label})", f"使用关键词 '{combined_keywords}' 进行搜索", 0, 0)
+        if ui_callback: ui_callback("处理子任务", f"开始处理: {current_task_label}", 0, 0)
+        search_attempts = 0
+        current_subtask_search_results = []
+        keywords_history = []
+        quality = "failed" # Default quality
+        while search_attempts < max_search_retries:
+            search_attempts += 1
+            if ui_callback and search_attempts > 1: ui_callback(f"搜索重试 ({search_attempts}/{max_search_retries}) - {current_task_label}", f"尝试为子任务 '{str(subtask)[:30]}...' 重新生成关键词并搜索",0,0)
+            t0_key = time.time()
+            keyword_prompt_addition = "" 
+            if keywords_history: keyword_prompt_addition = f"先前尝试过的关键词组合 {keywords_history} 未能得到满意的搜索结果。请尝试生成与之前显著不同的关键词。"
+            message_key = [
+                SystemMessage("""你是一名熟练的搜索引擎使用者。请根据用户的总体研究任务和当前正在处理的具体子任务/方面，生成3个最相关的搜索关键词。""" + keyword_prompt_addition + """输出格式必须是 Python 列表，例如：["关键词1", "关键词2", "关键词3"]"""),
+                HumanMessage(f"总体研究任务：{query}\n当前子任务/方面：{subtask}\n请生成搜索关键词。")
+            ]
+            if ui_callback: ui_callback(f"为子任务生成关键词... ({current_task_label}, 尝试 {search_attempts})", f"正在为 '{str(subtask)[:30]}...' 生成关键词", 0, 0)
+            response_key = await model.ainvoke(message_key)
+            t1_key = time.time()
+            tokens_key = _get_token_usage(response_key)
+            content_key = response_key.content
             try:
-                response = tavily_client.search(
-                    query=combined_keywords,
-                    search_depth="advanced",
-                    max_results=5,
-                    include_answer=True,
-                    include_raw_content=False,
-                    include_images=False
-                )
-                search_info_for_subtask.append({"keyword": combined_keywords, "info": response})
+                keywords_list = ast.literal_eval(content_key)
+                if not isinstance(keywords_list, list): keywords_list = [content_key]
+            except (ValueError, SyntaxError):
+                keywords_list = [content_key]
+                if ui_callback: ui_callback("解析关键词列表失败", {"子任务": subtask, "原始输出": content_key, "尝试次数": search_attempts}, tokens_key, t1_key - t0_key)
+            keywords_history.append(keywords_list)
+            if ui_callback: ui_callback(f"关键词生成完成 ({current_task_label}, 尝试 {search_attempts})", {"子任务": subtask, "关键词": keywords_list}, tokens_key, t1_key - t0_key)
+            t0_search = time.time()
+            search_info_for_attempt = []
+            search_summary_ui = ""
+            tavily_response_data = None
+            if not tavily_client:
+                error_msg = "Tavily Client 未初始化 (缺少 API 密钥)"
+                if ui_callback: ui_callback("搜索错误", error_msg, 0, 0)
+                search_info_for_attempt.append({"keyword": "N/A", "info": error_msg})
+                search_summary_ui += error_msg + "\n"
+                quality = "failed"
+            else:
+                combined_keywords = " ".join(keywords_list)
+                if ui_callback: ui_callback(f"查找信息 (Tavily)... ({current_task_label}, 尝试 {search_attempts})", f"使用关键词 '{combined_keywords}' 进行搜索", 0, 0)
+                try:
+                    tavily_response_data = tavily_client.search(query=combined_keywords, search_depth="advanced", max_results=5, include_answer=True, include_raw_content=False, include_images=False)
+                    search_info_for_attempt.append({"keyword": combined_keywords, "info": tavily_response_data})
+                    summary_for_ui = f"Tavily 搜索 '{combined_keywords}' (尝试 {search_attempts}):\n"
+                    if tavily_response_data.get("answer"): summary_for_ui += f"**综合答案:** {tavily_response_data['answer']}\n"
+                    summary_for_ui += "**相关结果:**\n"
+                    for idx, res in enumerate(tavily_response_data.get("results", [])[:3]): summary_for_ui += f"  {idx+1}. {res.get('title', 'N/A')}: {res.get('content', 'N/A')[:100]}...\n"
+                    search_summary_ui += summary_for_ui
+                except Exception as e:
+                    error_info = f"Tavily 搜索 '{combined_keywords}' (尝试 {search_attempts}) 时发生错误: {e}"
+                    if ui_callback: ui_callback("Tavily 搜索错误", error_info, 0, 0)
+                    search_info_for_attempt.append({"keyword": combined_keywords, "info": error_info})
+                    search_summary_ui += error_info + "\n"
+                    tavily_response_data = {"error": str(e)}
+            t1_search = time.time()
+            if ui_callback: ui_callback(f"查找信息完成 ({current_task_label}, 尝试 {search_attempts})", search_summary_ui, 0, t1_search - t0_search)
+            if tavily_response_data and not tavily_response_data.get("error"):
+                quality = await assess_search_quality(model, query, subtask, keywords_list, tavily_response_data, ui_callback)
+            else:
+                quality = "failed"
+                if ui_callback: ui_callback("搜索质量评估跳过", f"由于搜索错误，子任务 '{str(subtask)[:30]}...' 的搜索结果质量记为 failed", 0, 0)
+            current_subtask_search_results = search_info_for_attempt
+            if quality in ["excellent", "good"]:
+                if ui_callback: ui_callback("搜索结果接受", f"子任务 '{str(subtask)[:30]}...' 的搜索结果质量达标 ({quality.upper()})",0,0)
+                break
+            elif search_attempts >= max_search_retries:
+                if ui_callback: ui_callback("搜索重试达到上限", f"子任务 '{str(subtask)[:30]}...' 搜索重试次数已达上限，接受当前结果 (质量: {quality.upper()})",0,0)
+                break
+        aggregated_results.append({"subtask": subtask, "final_search_quality": quality, "search_attempts_taken": search_attempts, "search_results": current_subtask_search_results})
 
-                # 准备 UI 摘要
-                summary_for_ui = f"Tavily 搜索 '{combined_keywords}':\n"
-                if response.get("answer"):
-                     summary_for_ui += f"**综合答案:** {response['answer']}\n"
-                summary_for_ui += "**相关结果:**\n"
-                for idx, res in enumerate(response.get("results", [])[:3]):
-                    summary_for_ui += f"  {idx+1}. {res.get('title', 'N/A')}: {res.get('content', 'N/A')[:100]}...\n"
-
-                search_summary_ui += summary_for_ui
-
-            except Exception as e:
-                error_info = f"Tavily 搜索 '{combined_keywords}' 时发生错误: {e}"
-                if ui_callback:
-                     ui_callback("Tavily 搜索错误", error_info, 0, 0)
-                search_info_for_subtask.append({"keyword": combined_keywords, "info": error_info})
-                search_summary_ui += error_info + "\n"
-
-        t1_search = time.time()
-        if ui_callback:
-            ui_callback(f"查找信息完成 ({current_task_label})", search_summary_ui, 0, t1_search - t0_search)
-
-        # 存储这个子任务的搜索结果
-        aggregated_results.append({
-            "subtask": subtask,
-            "search_results": search_info_for_subtask
-        })
-
-    # --- 3. 最终报告汇总 --- (移除质检和迭代)
+    # --- 3. 最终报告汇总 --- (强化 Prompt 对 Markdown 的要求)
     t0_final_report = time.time()
-    final_report_message = [
-        SystemMessage("""
-                    你是顶级的分析报告撰写专家。你收到了用户最初的研究任务、该任务分解出的子任务列表、以及针对每个子任务通过 Tavily 搜索获得的信息（可能包含综合答案和多个结果条目）。
-                    你的目标是综合所有这些信息，撰写一份结构清晰、内容详实、逻辑连贯的最终研究报告，确保报告回答了用户最初的任务，并覆盖了所有分解出的子任务/方面。
-                    请直接输出最终的报告内容。
-                    """),
-        HumanMessage(f"""用户最初的研究任务：{query}
+    final_report_system_prompt = ("""
+你是一位顶级的分析报告撰写专家。你收到了用户的原始研究任务、该任务分解后的子任务列表，以及通过Tavily搜索获得的每个子任务的相关信息（包括搜索质量评估）。
+你的目标是整合所有这些信息，撰写一份结构清晰、内容详尽、表达丰富、逻辑连贯的最终研究报告。
+报告应回答用户的初始任务，并覆盖所有分解出的子任务/方面。
 
-分解出的子任务/方面列表：
+**报告撰写指南:**
+1.  **最大限度地利用多样化的Markdown格式。** 包括但不限于：
+    *   层级清晰的标题（例如：`# 主标题`, `## 子任务1：[子任务名称]`, `### 主要发现`, `#### 详细点`）。
+    *   用于强调关键点或关键词的**粗体**、*斜体*和 `代码片段`。
+    *   用于组织信息的无序列表（`-` 或 `*`）和有序列表。
+    *   使用引用块 (`>`) 来突出显示搜索结果中的直接引述或重要论述。
+    *   如果适用，使用Markdown表格来组织信息。
+2.  **内容的深化与整合**: 针对每个子任务，基于提供的Tavily搜索结果（特别是`answer`字段和`results`中的各个摘要），不仅仅是罗列信息，而是要深入挖掘和分析，并整合来自不同信息源的洞见。如果可能，请指出子任务之间的关联性。
+3.  **结构**: 整个报告应具有逻辑流程，包括清晰的引言（背景和目的）、每个子任务的详细分析（每个都像一个小章节一样对待），以及一个强有力的结论/总结（概述主要发现，如果可能，包括未来的展望或建议）。
+4.  **考虑搜索质量**: 如果某些子任务的搜索质量被标记为"poor"或"failed"，请在报告中明确指出相关信息可能缺失、有限，或需要谨慎解读。
+5.  **尝试视觉化表达**: 如果内容允许，尝试使用基于文本的图表（例如：用字符表示的简单条形图或树状结构）或Mermaid.js语法来生成图表，以更清晰地传达信息。Mermaid代码务必用 ```mermaid ... ``` 代码块包裹。例如：
+    ```mermaid
+    graph TD;
+        A-->B;
+        A-->C;
+        B-->D;
+        C-->D;
+    ```
+    这有助于展示复杂关系或流程。
+6.  **满足指定的字数要求**（如果提供，例如：1500字以上），提供足够详细的信息，使内容充实。避免仅仅为了凑字数而进行冗余描述。
+
+请直接输出最终报告的内容。
+""")
+
+    # 从 aggregated_results 中提取更易读的信息给 HumanMessage
+    # 这有助于减少传递给LLM的原始JSON的复杂性，并突出重点
+    readable_aggregated_info = []
+    for res in aggregated_results:
+        subtask_info = f"子任务: {res['subtask']}\n搜索质量: {res['final_search_quality']}\n试行次数: {res['search_attempts_taken']}\n"
+        search_details = ""
+        # 提取每个尝试的Tavily answer和部分results
+        if res.get('search_results'):
+            for attempt_idx, attempt in enumerate(res['search_results']): # search_results is a list of attempts (usually 1)
+                if attempt.get('info') and isinstance(attempt['info'], dict):
+                    tavily_data = attempt['info']
+                    if tavily_data.get('answer'):
+                        search_details += f"  Tavily的回答 (试行 {attempt_idx+1}): {tavily_data['answer']}\n"
+                    if tavily_data.get('results'):
+                        search_details += f"  相关结果 (试行 {attempt_idx+1}的Top3):\n"
+                        for r_idx, r_item in enumerate(tavily_data['results'][:3]):
+                            search_details += f"    {r_idx+1}. {r_item.get('title', 'N/A')}: {r_item.get('content', 'N/A')[:150]}...\n"
+                elif attempt.get('info'): # 如果info是错误字符串
+                     search_details += f"  搜索错误 (试行 {attempt_idx+1}): {attempt['info']}\n"
+        readable_aggregated_info.append(subtask_info + search_details)
+    
+    aggregated_info_for_prompt = "\n\n".join(readable_aggregated_info)
+
+    final_report_human_prompt = f"""用户最初的研究任务：{query}
+
+分解后的子任务/方面列表：
 {json.dumps(refined_subtasks, ensure_ascii=False, indent=2)}
 
-针对各子任务/方面搜索到的信息汇总：
-{json.dumps(aggregated_results, ensure_ascii=False, indent=2)}
+各子任务/方面搜索到的信息摘要：
+{aggregated_info_for_prompt}
 
-请基于以上所有信息，撰写最终的研究报告。""")
+以上所有信息基础上，撰写最终研究报告。使用Markdown格式，并遵循指定指示。"""
+
+    final_report_message = [
+        SystemMessage(final_report_system_prompt),
+        HumanMessage(final_report_human_prompt)
     ]
-    if ui_callback:
-        ui_callback("总结所有信息...", "正在综合所有子任务的搜索结果生成最终报告", 0, 0)
+    if ui_callback: ui_callback("总结所有信息...", "正在综合所有子任务的搜索结果生成最终报告", 0, 0)
     response_final_report = await model.ainvoke(final_report_message)
     t1_final_report = time.time()
     tokens_final_report = _get_token_usage(response_final_report)
     final_report = response_final_report.content
+    if ui_callback: ui_callback("生成最终报告", final_report, tokens_final_report, t1_final_report - t0_final_report)
 
-    if ui_callback:
-        # 显示完整报告或摘要给UI
-        # report_summary = final_report[:1000] + "..." if len(final_report) > 1000 else final_report
-        ui_callback("生成最终报告", final_report, tokens_final_report, t1_final_report - t0_final_report)
-
-    return {'task': query, 'report': final_report} # 返回最终结果
+    return {'task': query, 'report': final_report}
 
 # 仅在直接运行此脚本时执行
 if __name__ == "__main__":
